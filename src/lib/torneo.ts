@@ -1,0 +1,372 @@
+// Lógica de zonas y playoff (modelo en memoria; se guarda en Supabase desde almacen.ts)
+
+/** Doble Falta tiene una sola sede y una sola cancha: `sede` existe por compatibilidad con la base y no se carga. `cancha` quedó de versiones anteriores */
+export interface Horario { fecha: string; hora: string; sede?: string; cancha?: string }
+
+export interface Pareja {
+  id: string
+  /** "Juan Perez / Ricardo Lopez" (es lo que se muestra en zonas e imágenes) */
+  nombre: string
+  jugador1?: string
+  jugador2?: string
+  /** problemas de horario de la pareja (vacío si no tiene) */
+  horario?: string
+}
+/** Un lado de primera ronda del playoff: posición `pos` de la zona número `zona` (0 = A) */
+export interface Slot { zona: number; pos: number }
+
+/** Un torneo: datos, parejas, zonas y playoff (el nombre ya incluye la categoría: "7ma Caballeros – Primavera") */
+export interface Categoria {
+  id: string
+  torneo: string
+  /** YYYY-MM-DD */
+  fechaInicio: string
+  fechaFin: string
+  /** texto libre: formato de partidos, reglas, etc. */
+  observacion: string
+  /** monto de inscripción por jugador, solo dígitos ("17000"); vacío = no se muestra */
+  inscripcion: string
+  /** texto libre del premio ("50% de lo recaudado"); vacío = no se muestra */
+  premio: string
+  parejas: Pareja[]
+  /** ids de parejas por zona, en orden de posición (en zonas de 4: 1 vs 4 y 2 vs 3) */
+  zonas: string[][]
+  /** clave `${zona}-${partido}` */
+  horariosZona: Record<string, Horario>
+  /** primera ronda del playoff: [ladoA, ladoB] por partido (null = libre, el otro pasa directo) */
+  cuadro: (Slot | null)[][] | null
+  /** clave `${ronda}-${orden}` */
+  horariosPlayoff: Record<string, Horario>
+  /** formato de partido de cada instancia (zonas, octavos, cuartos…) */
+  formatos: Record<Instancia, Formato>
+  /** resultados de zona, misma clave que horariosZona */
+  resultadosZona: Record<string, Resultado>
+  /** resultados de playoff, misma clave que horariosPlayoff */
+  resultadosPlayoff: Record<string, Resultado>
+  /** orden definido a mano ante un empate total en una zona: zona → ids de pareja */
+  desempates: Record<string, string[]>
+  actualizado: number
+}
+
+// ------------------------------------------------------------------ formatos de partido
+
+export type Formato = 'mejor_de_3' | 'mejor_de_3_stb' | 'americano_7' | 'americano_9'
+export type Instancia = 'zonas' | '16avos' | 'octavos' | 'cuartos' | 'semifinal' | 'final'
+
+export const FORMATOS: { id: Formato; nombre: string; corto: string }[] = [
+  { id: 'mejor_de_3', nombre: 'Al mejor de 3 sets', corto: 'Mejor de 3 sets' },
+  { id: 'mejor_de_3_stb', nombre: 'Al mejor de 3 sets, el 3ro super tiebreak a 11', corto: 'Mejor de 3 · 3ro super TB a 11' },
+  { id: 'americano_7', nombre: 'Americano a 7 games', corto: 'Americano a 7' },
+  { id: 'americano_9', nombre: 'Americano a 9 games', corto: 'Americano a 9' },
+]
+export const nombreFormato = (f: Formato) => FORMATOS.find((x) => x.id === f)?.nombre ?? f
+
+export const INSTANCIAS: { id: Instancia; nombre: string }[] = [
+  { id: 'zonas', nombre: 'Zonas' },
+  { id: '16avos', nombre: '16avos' },
+  { id: 'octavos', nombre: 'Octavos' },
+  { id: 'cuartos', nombre: 'Cuartos' },
+  { id: 'semifinal', nombre: 'Semifinal' },
+  { id: 'final', nombre: 'Final' },
+]
+export const nombreInstancia = (i: Instancia) => INSTANCIAS.find((x) => x.id === i)?.nombre ?? i
+
+/** Lo que más se juega: americano a 9 hasta cuartos; semi y final al mejor de 3 con super tiebreak */
+export const FORMATOS_DEFECTO: Record<Instancia, Formato> = {
+  zonas: 'americano_9', '16avos': 'americano_9', octavos: 'americano_9', cuartos: 'americano_9', semifinal: 'mejor_de_3_stb', final: 'mejor_de_3_stb',
+}
+
+/**
+ * Resultado de un partido. `a` y `b` son las parejas que lo jugaron (en el orden del partido):
+ * si después cambian (se corrigió un resultado anterior o las zonas), el resultado queda desactualizado.
+ * `sets` = games de A y de B en cada set ([[6,4],[3,6],[10,8]]). `wo` = gana ese lado por walkover.
+ */
+export interface Resultado { a: string; b: string; sets: [number, number][]; wo?: 'a' | 'b' }
+
+export const LETRAS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+/** Completa campos que no existían en torneos guardados con versiones anteriores */
+export function normalizar(c: Categoria): Categoria {
+  // versiones anteriores tenían "categoria" aparte: se suma al nombre
+  const { categoria, ...resto } = c as Categoria & { categoria?: string }
+  const torneo = [c.torneo, categoria].map((x) => x?.trim()).filter(Boolean).join(' - ')
+  return {
+    ...resto,
+    torneo,
+    fechaInicio: c.fechaInicio ?? '', fechaFin: c.fechaFin ?? '', observacion: c.observacion ?? '', inscripcion: c.inscripcion ?? '', premio: c.premio ?? '',
+    horariosZona: c.horariosZona ?? {}, horariosPlayoff: c.horariosPlayoff ?? {},
+    formatos: { ...FORMATOS_DEFECTO, ...(c.formatos ?? {}) },
+    resultadosZona: c.resultadosZona ?? {}, resultadosPlayoff: c.resultadosPlayoff ?? {}, desempates: c.desempates ?? {},
+  }
+}
+
+/** "17000" → "$17.000" */
+export const formatoPesos = (v: string) => (v ? `$${Number(v).toLocaleString('es-AR')}` : '')
+
+export const MIN_PAREJAS = 6
+export const MAX_PAREJAS = 24
+
+/** UUID v4 (los ids se guardan en columnas uuid de la base) */
+export function nuevoId(): string {
+  if (crypto.randomUUID) return crypto.randomUUID()
+  const b = crypto.getRandomValues(new Uint8Array(16))
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+export const esUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)
+
+/** Datos obligatorios del paso "Torneo": nombre y fechas (fin igual o posterior al inicio). Recién ahí se crea en la base */
+export const datosCompletos = (c: Pick<Categoria, 'torneo' | 'fechaInicio' | 'fechaFin'>) =>
+  !!c.torneo.trim() && !!c.fechaInicio && !!c.fechaFin && c.fechaFin >= c.fechaInicio
+
+export function nuevaCategoria(): Categoria {
+  return {
+    id: nuevoId(), torneo: '', fechaInicio: '', fechaFin: '', observacion: '', inscripcion: '', premio: '', parejas: [], zonas: [],
+    horariosZona: {}, cuadro: null, horariosPlayoff: {}, formatos: { ...FORMATOS_DEFECTO }, resultadosZona: {}, resultadosPlayoff: {}, desempates: {},
+    actualizado: Date.now(),
+  }
+}
+
+/** "JUaN  perez" → "Juan Perez" (también "maría-josé" → "María-José") */
+export function nombrePropio(t: string): string {
+  return t
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase('es')
+    .replace(/(^|[\s-])(\p{L})/gu, (_, sep: string, l: string) => sep + l.toLocaleUpperCase('es'))
+}
+
+/** Clave para comparar jugadores sin importar mayúsculas, tildes ni espacios */
+const claveJugador = (t: string) => t.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().replace(/\s+/g, ' ').trim()
+
+/** Misma pareja = mismos dos jugadores, en cualquier orden */
+export const clavePareja = (j1: string, j2: string) => [claveJugador(j1), claveJugador(j2)].sort().join('|')
+
+/** Jugadores de una pareja (las guardadas antes solo tenían `nombre`) */
+export function jugadoresDe(p: Pareja): [string, string] {
+  if (p.jugador1 !== undefined && p.jugador2 !== undefined) return [p.jugador1, p.jugador2]
+  const [a = '', ...b] = p.nombre.split(' / ')
+  return [a, b.join(' / ')]
+}
+
+/** "A / B; C / D" o una por línea */
+export function parsearParejas(texto: string): string[] {
+  return texto.split(/[\n;]+/).map((x) => x.replace(/\s+/g, ' ').replace(/\s*\/\s*/g, ' / ').trim()).filter(Boolean)
+}
+
+// ------------------------------------------------------------------ zonas
+
+/** Reparto por defecto: floor(n/3) zonas; las primeras quedan de 4 y el resto de 3 */
+export function sugerirZonas(ids: string[], aleatorio: boolean): string[][] {
+  const lista = [...ids]
+  if (aleatorio) {
+    for (let i = lista.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      ;[lista[i], lista[j]] = [lista[j], lista[i]]
+    }
+  }
+  const cant = Math.floor(lista.length / 3)
+  if (cant < 1) return []
+  const de4 = lista.length - 3 * cant
+  const out: string[][] = []
+  let k = 0
+  for (let z = 0; z < cant; z++) {
+    const tam = z < de4 ? 4 : 3
+    out.push(lista.slice(k, k + tam))
+    k += tam
+  }
+  return out
+}
+
+export interface PartidoZona { key: string; zona: number; numero: number; titulo: string; codigo: string; a: string; b: string }
+
+/** Partidos de una zona. Zona de 3: todos contra todos. Zona de 4: 1v4, 2v3, ganadores y perdedores */
+export function partidosDeZona(zona: string[], zi: number, nombre: (id: string) => string): PartidoZona[] {
+  const n = (i: number) => nombre(zona[i])
+  const p = (numero: number, titulo: string, codigo: string, a: string, b: string): PartidoZona =>
+    ({ key: `${zi}-${numero}`, zona: zi, numero, titulo, codigo, a, b })
+  if (zona.length === 3) {
+    return [p(1, 'Partido 1', '1 v 2', n(0), n(1)), p(2, 'Partido 2', '1 v 3', n(0), n(2)), p(3, 'Partido 3', '2 v 3', n(1), n(2))]
+  }
+  if (zona.length === 4) {
+    return [
+      p(1, 'Partido 1', '1 v 4', n(0), n(3)),
+      p(2, 'Partido 2', '2 v 3', n(1), n(2)),
+      p(3, 'Ganadores', 'G v G', 'Ganador P1', 'Ganador P2'),
+      p(4, 'Perdedores', 'P v P', 'Perdedor P1', 'Perdedor P2'),
+    ]
+  }
+  return []
+}
+
+export const firmaZonas = (zonas: string[][]) => zonas.map((z) => z.length).join(',')
+
+// ------------------------------------------------------------------ playoff
+
+export interface Clasificado { key: string; zona: number; pos: number; label: string }
+
+export const etiquetaSlot = (s: Slot) => `${s.pos}° Zona ${LETRAS[s.zona]}`
+
+/** Clasifican 1° y 2° en zonas de 3; 1°, 2° y 3° en zonas de 4. Orden de siembra: 1°s, 2°s, 3°s */
+export function clasificados(zonas: string[][]): Clasificado[] {
+  const out: Clasificado[] = []
+  for (const pos of [1, 2, 3]) {
+    zonas.forEach((z, zi) => {
+      const cupo = z.length === 4 ? 3 : 2
+      if (pos <= cupo) out.push({ key: `${zi}:${pos}`, zona: zi, pos, label: etiquetaSlot({ zona: zi, pos }) })
+    })
+  }
+  return out
+}
+
+export function tamCuadro(q: number) {
+  let b = 2
+  while (b < q) b *= 2
+  return b
+}
+
+const FASES: Record<number, string> = { 2: 'Final', 4: 'Semifinal', 8: 'Cuartos', 16: 'Octavos', 32: '16avos' }
+export const nombreFase = (tamRonda: number) => FASES[tamRonda] ?? `Ronda de ${tamRonda}`
+const INSTANCIA_DE_TAM: Record<number, Instancia> = { 2: 'final', 4: 'semifinal', 8: 'cuartos', 16: 'octavos', 32: '16avos' }
+/** Instancia de una ronda según cuántas parejas la juegan (8 → cuartos) */
+export const instanciaDeTam = (tamRonda: number): Instancia => INSTANCIA_DE_TAM[tamRonda] ?? '16avos'
+/** Instancia de la ronda `ronda` (1 = primera) de un cuadro de `partidosPrimera` partidos */
+export const instanciaDeRonda = (partidosPrimera: number, ronda: number) => instanciaDeTam((partidosPrimera * 2) / 2 ** (ronda - 1))
+
+/** Cuadro automático: siembra estándar y sin cruces de la misma zona en primera ronda */
+export function cuadroAutomatico(zonas: string[][]): (Slot | null)[][] {
+  const cl = clasificados(zonas)
+  const q = cl.length
+  const b = tamCuadro(q)
+  let seeds = [1]
+  while (seeds.length < b) {
+    const n = seeds.length
+    seeds = seeds.flatMap((s) => [s, 2 * n + 1 - s])
+  }
+  const slots: (Slot | null)[] = seeds.map((s) => (s <= q ? { zona: cl[s - 1].zona, pos: cl[s - 1].pos } : null))
+  for (let j = 0; j < b / 2; j++) {
+    const a = slots[2 * j], c = slots[2 * j + 1]
+    if (a && c && a.zona === c.zona) {
+      for (let k = 0; k < b / 2; k++) {
+        const x = slots[2 * k + 1], y = slots[2 * k]
+        if (k !== j && x && x.zona !== a.zona && (!y || y.zona !== c.zona)) {
+          slots[2 * j + 1] = x
+          slots[2 * k + 1] = c
+          break
+        }
+      }
+    }
+  }
+  const out: (Slot | null)[][] = []
+  for (let j = 0; j < b / 2; j++) out.push([slots[2 * j], slots[2 * j + 1]])
+  return out
+}
+
+export function erroresCuadro(cruces: (Slot | null | undefined)[][], zonas: string[][]): string[] {
+  const cl = clasificados(zonas)
+  const b = tamCuadro(cl.length)
+  const err: string[] = []
+  if (cruces.length !== b / 2) return [`El cuadro tiene que tener ${b / 2} partidos.`]
+  // un lado sin elegir se guarda como { zona: -1, pos: -1 } (en JSON no existe undefined)
+  const planos = cruces.flat().map((v) => (v && v.zona < 0 ? undefined : v))
+  if (planos.some((v) => v === undefined)) err.push('Completá todos los lados.')
+  const usados = new Map<string, number>()
+  planos.forEach((v) => { if (v) usados.set(`${v.zona}:${v.pos}`, (usados.get(`${v.zona}:${v.pos}`) ?? 0) + 1) })
+  const faltan = cl.filter((c) => !usados.has(c.key))
+  if (faltan.length) err.push(`Falta ubicar: ${faltan.map((c) => c.label).join(', ')}.`)
+  if ([...usados.values()].some((n) => n > 1)) err.push('Hay clasificados repetidos.')
+  const libres = planos.filter((v) => v === null).length
+  if (!planos.some((v) => v === undefined) && libres !== b - cl.length) err.push(`Tiene que haber exactamente ${b - cl.length} lado(s) libre(s).`)
+  if (cruces.some(([a, c]) => a === null && c === null)) err.push('Un partido no puede tener los dos lados libres.')
+  return err
+}
+
+export interface PartidoPlayoff {
+  key: string
+  ronda: number        // 1 = primera ronda
+  orden: number        // 1..n dentro de la ronda
+  fase: string         // Cuartos, Semifinal, Final…
+  titulo: string       // "Cuartos 2", "Final"
+  a: string
+  b: string
+  /** primera ronda con un lado libre: no se juega, el otro pasa directo */
+  bye: boolean
+}
+
+/** Todas las rondas del cuadro, con lo que se sabe de cada lado ("1° Zona A", "Ganador Cuartos 2") */
+export function rondasPlayoff(cuadro: (Slot | null)[][]): PartidoPlayoff[][] {
+  const b = cuadro.length * 2
+  const rondas: PartidoPlayoff[][] = []
+  let tam = b
+  let r = 1
+  let previa: PartidoPlayoff[] = []
+  while (tam >= 2) {
+    const fase = nombreFase(tam)
+    const lista: PartidoPlayoff[] = []
+    for (let j = 1; j <= tam / 2; j++) {
+      const titulo = tam === 2 ? fase : `${fase} ${j}`
+      let a: string, bb: string, bye = false
+      if (r === 1) {
+        const [sa, sb] = cuadro[j - 1]
+        a = sa ? etiquetaSlot(sa) : 'Libre'
+        bb = sb ? etiquetaSlot(sb) : 'Libre'
+        bye = !sa || !sb
+      } else {
+        const lado = (f: PartidoPlayoff) => (f.bye ? (f.a === 'Libre' ? f.b : f.a) : `Ganador ${f.titulo}`)
+        a = lado(previa[2 * j - 2])
+        bb = lado(previa[2 * j - 1])
+      }
+      lista.push({ key: `${r}-${j}`, ronda: r, orden: j, fase, titulo, a, b: bb, bye })
+    }
+    rondas.push(lista)
+    previa = lista
+    tam /= 2
+    r++
+  }
+  return rondas
+}
+
+// ------------------------------------------------------------------ fechas
+
+const DIAS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb']
+const DIAS_LARGOS = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado']
+const aFecha = (f: string) => new Date(`${f}T12:00:00`)
+/** "Vie 26/09" */
+export const diaCorto = (f: string) => {
+  const d = aFecha(f)
+  return `${DIAS[d.getDay()]} ${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+/** "Viernes 26" */
+export const diaLargo = (f: string) => { const d = aFecha(f); return `${DIAS_LARGOS[d.getDay()]} ${d.getDate()}` }
+/** "Vie 25/09 al Sáb 26/09" (o un solo día) */
+export const rangoFechas = (ini: string, fin: string) =>
+  !ini ? '' : !fin || fin === ini ? diaCorto(ini) : `${diaCorto(ini)} al ${diaCorto(fin)}`
+
+/** "Vie 26/09 · 19:00 hs" */
+export function textoHorario(h: Horario | undefined, corto = false): string {
+  if (!h || (!h.fecha && !h.hora)) return corto ? 'A confirmar' : 'Día y horario a confirmar'
+  const partes: string[] = []
+  if (h.fecha) partes.push(diaCorto(h.fecha))
+  if (h.hora) partes.push(corto ? h.hora : `${h.hora} hs`)
+  return partes.join(' · ')
+}
+export const horarioCompleto = (h: Horario | undefined) => !!h?.fecha && !!h?.hora
+
+const dos = (n: number) => String(n).padStart(2, '0')
+/** Hoy en hora local ("YYYY-MM-DD"; toISOString da la fecha UTC, que después de las 21 ya es mañana) */
+export const hoyLocal = () => { const d = new Date(); return `${d.getFullYear()}-${dos(d.getMonth() + 1)}-${dos(d.getDate())}` }
+/** ¿Esa fecha (y hora, si está) ya pasó? Sin hora, cuenta como pasada solo si el día es anterior a hoy */
+export function enPasado(fecha: string, hora?: string): boolean {
+  if (!fecha) return false
+  if (!hora) return fecha < hoyLocal()
+  return new Date(`${fecha}T${hora}:00`).getTime() < Date.now()
+}
+
+/** Suma minutos a una fecha/hora local "YYYY-MM-DD" + "HH:MM" */
+export function sumarMinutos(fecha: string, hora: string, min: number): { fecha: string; hora: string } {
+  const d = new Date(`${fecha}T${hora}:00`)
+  d.setMinutes(d.getMinutes() + min)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return { fecha: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`, hora: `${p(d.getHours())}:${p(d.getMinutes())}` }
+}
