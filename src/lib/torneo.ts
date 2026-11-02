@@ -31,17 +31,20 @@ export interface Categoria {
   parejas: Pareja[]
   /** ids de parejas por zona, en orden de posición (en zonas de 4: 1 vs 4 y 2 vs 3) */
   zonas: string[][]
-  /** clave `${zona}-${partido}` */
+  /**
+   * Inicio de cada zona (día y hora del primer partido). Se guarda con la clave del primer partido de la zona
+   * (`${zona}-1`); las demás claves son de versiones anteriores (un horario por partido) y ya no se usan.
+   */
   horariosZona: Record<string, Horario>
   /** primera ronda del playoff: [ladoA, ladoB] por partido (null = libre, el otro pasa directo) */
   cuadro: (Slot | null)[][] | null
-  /** clave `${ronda}-${orden}` */
+  /** Versiones anteriores cargaban día y hora de cada partido de playoff; ya no se usa (se conserva solo para no perder lo guardado) */
   horariosPlayoff: Record<string, Horario>
   /** formato de partido de cada instancia (zonas, octavos, cuartos…) */
   formatos: Record<Instancia, Formato>
-  /** resultados de zona, misma clave que horariosZona */
+  /** resultados de zona: clave `${zona}-${partido}` */
   resultadosZona: Record<string, Resultado>
-  /** resultados de playoff, misma clave que horariosPlayoff */
+  /** resultados de playoff: clave `${ronda}-${orden}` */
   resultadosPlayoff: Record<string, Resultado>
   /** orden definido a mano ante un empate total en una zona: zona → ids de pareja */
   desempates: Record<string, string[]>
@@ -55,7 +58,7 @@ export type Instancia = 'zonas' | '16avos' | 'octavos' | 'cuartos' | 'semifinal'
 
 export const FORMATOS: { id: Formato; nombre: string; corto: string }[] = [
   { id: 'mejor_de_3', nombre: 'Al mejor de 3 sets', corto: 'Mejor de 3 sets' },
-  { id: 'mejor_de_3_stb', nombre: 'Al mejor de 3 sets, el 3ro super tiebreak a 11', corto: 'Mejor de 3 · 3ro super TB a 11' },
+  { id: 'mejor_de_3_stb', nombre: 'Al mejor de 3 sets, el 3ro super tiebreak a 11', corto: 'Mejor de 3 · STB a 11' },
   { id: 'americano_7', nombre: 'Americano a 7 games', corto: 'Americano a 7' },
   { id: 'americano_9', nombre: 'Americano a 9 games', corto: 'Americano a 9' },
 ]
@@ -116,9 +119,14 @@ export function nuevoId(): string {
 }
 export const esUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)
 
+/** Clave con la que se guarda el inicio de la zona `zi` (la del primer partido) */
+export const claveInicioZona = (zi: number) => `${zi}-1`
+/** Día y hora en que arranca la zona `zi` */
+export const inicioZona = (c: Pick<Categoria, 'horariosZona'>, zi: number): Horario | undefined => c.horariosZona[claveInicioZona(zi)]
+
 /**
- * Datos por defecto de los partidos que todavía no se jugaron (cuando las zonas ya están armadas):
- * · torneo de un solo día → todos los partidos con ese día
+ * Día por defecto del inicio de cada zona que todavía no arrancó (cuando las zonas ya están armadas):
+ * si el torneo es de un solo día, ese día.
  * Devuelve el mismo objeto si no hay nada para completar (se puede llamar en cada cambio).
  */
 export function precargarHorarios(c: Categoria): Categoria {
@@ -128,26 +136,16 @@ export function precargarHorarios(c: Categoria): Categoria {
     c.parejas.every((p) => ubicadas.has(p.id)) && c.zonas.flat().length === ubicadas.size
   if (!unDia || !zonasArmadas) return c
 
-  const completar = (horarios: Record<string, Horario>, claves: string[], jugados: Record<string, unknown>) => {
-    let out = horarios
-    for (const k of claves) {
-      if (jugados[k]) continue
-      const h = horarios[k]
-      const fecha = h?.fecha || (unDia ? c.fechaInicio : '')
-      if (fecha === (h?.fecha ?? '')) continue
-      if (out === horarios) out = { ...horarios }
-      out[k] = { ...h, fecha, hora: h?.hora ?? '' }
-    }
-    return out
-  }
-
-  const clavesZona = c.zonas.flatMap((z, zi) => partidosDeZona(z, zi, () => '').map((p) => p.key))
-  const clavesPlayoff = c.cuadro && erroresCuadro(c.cuadro, c.zonas).length === 0
-    ? rondasPlayoff(c.cuadro).flat().filter((p) => !p.bye).map((p) => p.key)
-    : []
-  const hz = completar(c.horariosZona, clavesZona, c.resultadosZona)
-  const hp = completar(c.horariosPlayoff, clavesPlayoff, c.resultadosPlayoff)
-  return hz === c.horariosZona && hp === c.horariosPlayoff ? c : { ...c, horariosZona: hz, horariosPlayoff: hp }
+  let out = c.horariosZona
+  c.zonas.forEach((_, zi) => {
+    const k = claveInicioZona(zi)
+    if (c.resultadosZona[k]) return
+    const h = c.horariosZona[k]
+    if (h?.fecha) return
+    if (out === c.horariosZona) out = { ...c.horariosZona }
+    out[k] = { ...h, fecha: c.fechaInicio, hora: h?.hora ?? '' }
+  })
+  return out === c.horariosZona ? c : { ...c, horariosZona: out }
 }
 
 /** Datos obligatorios del paso "Torneo": nombre y fechas (fin igual o posterior al inicio). Recién ahí se crea en la base */
@@ -268,7 +266,12 @@ export const instanciaDeTam = (tamRonda: number): Instancia => INSTANCIA_DE_TAM[
 /** Instancia de la ronda `ronda` (1 = primera) de un cuadro de `partidosPrimera` partidos */
 export const instanciaDeRonda = (partidosPrimera: number, ronda: number) => instanciaDeTam((partidosPrimera * 2) / 2 ** (ronda - 1))
 
-/** Cuadro automático: siembra estándar y sin cruces de la misma zona en primera ronda */
+/**
+ * Cuadro automático. Parte de la siembra estándar (1° de zona primero, después 2° y 3°) y reordena los lados para que
+ * las parejas de una misma zona queden lo más lejos posible en el cuadro: si se tienen que cruzar, que sea en la
+ * final y no en la primera ronda. Se prueba con intercambios (de a un lado) y se queda con el cuadro cuyo primer cruce
+ * entre parejas de la misma zona ocurre lo más tarde posible.
+ */
 export function cuadroAutomatico(zonas: string[][]): (Slot | null)[][] {
   const cl = clasificados(zonas)
   const q = cl.length
@@ -279,19 +282,49 @@ export function cuadroAutomatico(zonas: string[][]): (Slot | null)[][] {
     seeds = seeds.flatMap((s) => [s, 2 * n + 1 - s])
   }
   const slots: (Slot | null)[] = seeds.map((s) => (s <= q ? { zona: cl[s - 1].zona, pos: cl[s - 1].pos } : null))
-  for (let j = 0; j < b / 2; j++) {
-    const a = slots[2 * j], c = slots[2 * j + 1]
-    if (a && c && a.zona === c.zona) {
-      for (let k = 0; k < b / 2; k++) {
-        const x = slots[2 * k + 1], y = slots[2 * k]
-        if (k !== j && x && x.zona !== a.zona && (!y || y.zona !== c.zona)) {
-          slots[2 * j + 1] = x
-          slots[2 * k + 1] = c
-          break
-        }
+  const rondas = Math.log2(b)
+
+  /** Ronda en la que se cruzarían dos posiciones del cuadro (1 = primera ronda, `rondas` = final) */
+  const rondaDeCruce = (i: number, j: number) => {
+    let r = 1
+    let x = Math.floor(i / 2), y = Math.floor(j / 2)
+    while (x !== y) { x = Math.floor(x / 2); y = Math.floor(y / 2); r++ }
+    return r
+  }
+  /** Puntaje: cuanto más temprano se cruzan dos de una misma zona, más pesa (primera ronda >> semifinal >> final) */
+  const costo = (s: (Slot | null)[]) => {
+    let c = 0
+    for (let i = 0; i < b; i++) {
+      const a = s[i]
+      if (!a) continue
+      for (let j = i + 1; j < b; j++) {
+        const o = s[j]
+        if (o && o.zona === a.zona) c += 4 ** (rondas - rondaDeCruce(i, j))
+      }
+    }
+    return c
+  }
+
+  // mejora local: intercambia lados mientras baje el costo. Los 1° y los "libres" de la siembra no se mueven
+  // (los libres le corresponden a los mejores sembrados). Entre los demás se prueba cualquier par.
+  const fijos = new Set<number>()
+  seeds.forEach((s, i) => { if (s <= Math.min(q, zonas.length) || s > q) fijos.add(i) })
+  const movibles = slots.map((_, i) => i).filter((i) => !fijos.has(i))
+  let mejor = costo(slots)
+  let mejora = true
+  let vueltas = 0
+  while (mejora && vueltas++ < 200) {
+    mejora = false
+    for (let x = 0; x < movibles.length; x++) {
+      for (let y = x + 1; y < movibles.length; y++) {
+        const i = movibles[x], j = movibles[y]
+        ;[slots[i], slots[j]] = [slots[j], slots[i]]
+        const c = costo(slots)
+        if (c < mejor) { mejor = c; mejora = true } else [slots[i], slots[j]] = [slots[j], slots[i]]
       }
     }
   }
+
   const out: (Slot | null)[][] = []
   for (let j = 0; j < b / 2; j++) out.push([slots[2 * j], slots[2 * j + 1]])
   return out
